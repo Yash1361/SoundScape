@@ -1,3 +1,5 @@
+// through the chairs
+// fix the sound 
 import SwiftUI
 import Vision
 import ARKit
@@ -66,11 +68,18 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
     private var obstacleDetectionTimer: Timer?
     private let safeZoneDistance: Float = 0.9
     private let directions: [SIMD3<Float>] = [
-        SIMD3<Float>(0, 0, -1),
-        SIMD3<Float>(-0.5, 0, -0.5),
-        SIMD3<Float>(0.5, 0, -0.5),
-        SIMD3<Float>(-1, 0, 0),
-        SIMD3<Float>(1, 0, 0)
+        SIMD3<Float>(0, 0, -1),      // Forward
+        SIMD3<Float>(-0.5, 0, -0.5), // Left-forward
+        SIMD3<Float>(0.5, 0, -0.5),  // Right-forward
+        SIMD3<Float>(-1, 0, 0),      // Left
+        SIMD3<Float>(1, 0, 0),       // Right
+        SIMD3<Float>(0, -0.3, -0.7), // Slightly down-forward
+        SIMD3<Float>(-0.3, -0.3, -0.7), // Slightly down-left-forward
+        SIMD3<Float>(0.3, -0.3, -0.7),  // Slightly down-right-forward
+        SIMD3<Float>(0, -0.7, -0.3), // Steep down-forward
+        SIMD3<Float>(-0.5, -0.5, -0.5), // Down-left-forward
+        SIMD3<Float>(0.5, -0.5, -0.5),  // Down-right-forward
+        SIMD3<Float>(0, -1, 0)       // Straight down
     ]
     
     override init() {
@@ -109,14 +118,11 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
         audioEngine.attach(obstaclePlayerNode)
         audioEngine.attach(pannerNode)
         
-        // Connect guidePlayerNode -> pannerNode
+        // Connect nodes
         audioEngine.connect(guidePlayerNode, to: pannerNode, format: nil)
-        // Connect pannerNode -> main mixer
         audioEngine.connect(pannerNode, to: audioEngine.mainMixerNode, format: nil)
-        // Connect obstaclePlayerNode directly to main mixer
         audioEngine.connect(obstaclePlayerNode, to: audioEngine.mainMixerNode, format: nil)
         
-        // Debug: Confirm connections
         print("AudioEngine connections established")
         
         // Load audio files
@@ -127,47 +133,30 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
         }
         
         do {
-            // Load audio files
-            let guideAudioFileTemp = try AVAudioFile(forReading: guideURL)
-            let obstacleAudioFileTemp = try AVAudioFile(forReading: obstacleURL)
-            print("Audio files loaded successfully")
-            
-            // Get main mixer format for buffer conversion
             let mainMixerFormat = audioEngine.mainMixerNode.outputFormat(forBus: 0)
             print("Main mixer format: \(mainMixerFormat.channelCount) channels, \(mainMixerFormat.sampleRate) Hz")
             
-            // Convert guide audio buffer to match main mixer format
-            let guideBufferTemp = try loadPCMBuffer(from: guideAudioFileTemp, to: mainMixerFormat)
-            self.guideBuffer = guideBufferTemp
+            // Load and convert guide audio buffer
+            let guideAudioFile = try AVAudioFile(forReading: guideURL)
+            self.guideBuffer = try loadPCMBuffer(from: guideAudioFile, to: mainMixerFormat)
             print("Guide audio buffer converted to main mixer format")
             
-            // Convert obstacle audio buffer to match main mixer format
-            let obstacleBufferTemp = try loadPCMBuffer(from: obstacleAudioFileTemp, to: mainMixerFormat)
-            self.obstacleBuffer = obstacleBufferTemp
-            print("Obstacle audio buffer converted to main mixer format")
+            // Load and convert obstacle audio buffer
+            let obstacleAudioFile = try AVAudioFile(forReading: obstacleURL)
+            self.obstacleBuffer = try loadPCMBuffer(from: obstacleAudioFile, to: mainMixerFormat)
+            print("Obstacle audio buffer loaded successfully")
             
-        } catch {
-            print("Error loading audio files or creating buffers: \(error.localizedDescription)")
-            return
-        }
-        
-        do {
             // Configure audio session
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(.playback, mode: .default, options: [])
             try audioSession.setActive(true)
             print("Audio session set up successfully")
-        } catch {
-            print("Error setting up audio session: \(error.localizedDescription)")
-            return
-        }
-        
-        do {
+            
             // Start the audio engine
             try audioEngine.start()
             print("Audio engine started successfully")
         } catch {
-            print("Error starting audio engine: \(error.localizedDescription)")
+            print("Error setting up audio: \(error.localizedDescription)")
         }
     }
     
@@ -266,15 +255,16 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
         }
         
         obstaclePlayerNode.stop()
-        obstaclePlayerNode.scheduleBuffer(obstacleBuffer, at: nil, options: [], completionHandler: nil)
+        obstaclePlayerNode.scheduleBuffer(obstacleBuffer, at: nil, options: [.loops, .interrupts], completionHandler: nil)
         obstaclePlayerNode.play()
-        print("Obstacle audio started")
+        print("Obstacle audio started and looping")
     }
     
     func stopObstacleAudio() {
         obstaclePlayerNode.stop()
         print("Obstacle audio stopped")
     }
+
     
     // MARK: - Audio Position Updates
     func updateGuideAudioPosition(targetPosition: simd_float3, listenerPosition: simd_float3, listenerForward: simd_float3) {
@@ -312,12 +302,14 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
     }
     
     func updateObstacleAudio(distance: Float, direction: SIMD3<Float>) {
-        if distance < safeZoneDistance {
+        let lowObjectSafeZoneDistance: Float = safeZoneDistance * 1.1
+        
+        if distance < lowObjectSafeZoneDistance {
             if !hasObstacle {
                 startObstacleAudio()
                 hasObstacle = true
             }
-            let volume = 1.0 - (distance / safeZoneDistance)
+            let volume = 1.0 - (distance / lowObjectSafeZoneDistance)
             let pan = direction.x
             obstaclePlayerNode.volume = volume
             obstaclePlayerNode.pan = pan
@@ -364,7 +356,6 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
         
         let cameraTransform = frame.camera.transform
         let cameraPosition = simd_make_float3(cameraTransform.columns.3)
-        let cameraForward = simd_make_float3(cameraTransform.columns.2)
         
         var closestDistance: Float = Float.greatestFiniteMagnitude
         var closestDirection: SIMD3<Float> = SIMD3<Float>(0, 0, -1)
@@ -379,14 +370,21 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
             let results = arView.session.raycast(query)
             if let result = results.first {
                 let distance = simd_distance(cameraPosition, simd_make_float3(result.worldTransform.columns.3))
-                if distance < closestDistance {
-                    closestDistance = distance
+                
+                // Adjust distance calculation for downward-facing rays
+                let adjustedDistance = distance * (1 + abs(direction.y))
+                
+                if adjustedDistance < closestDistance {
+                    closestDistance = adjustedDistance
                     closestDirection = worldDirection
                 }
             }
         }
         
-        if closestDistance < safeZoneDistance {
+        // Increase the safe zone distance for low objects
+        let lowObjectSafeZoneDistance: Float = safeZoneDistance * 1.5
+        
+        if closestDistance < lowObjectSafeZoneDistance {
             updateObstacleAudio(distance: closestDistance, direction: closestDirection)
         } else {
             updateObstacleAudio(distance: Float.greatestFiniteMagnitude, direction: SIMD3<Float>(0, 0, -1))
