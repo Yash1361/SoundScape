@@ -1,88 +1,180 @@
-import UIKit
+import SwiftUI
+import Speech
 import AVFoundation
-import Vision
 
-class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate {
+enum FindOption: String, CaseIterable {
+    case bottle = "bottle"
+    case backpack = "backpack"
+    case cellphone = "cellphone"
+}
+
+class SpeechRecognizer: ObservableObject {
+    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))!
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private let audioEngine = AVAudioEngine()
+    private var silenceTimer: Timer?
+    private let synthesizer = AVSpeechSynthesizer()
     
-    var captureSession: AVCaptureSession!
-    var previewLayer: AVCaptureVideoPreviewLayer!
-    var objectDetectionRequest: VNCoreMLRequest!
+    @Published var isListening = false
+    @Published var recognizedText = ""
+    @Published var selectedOption: FindOption?
+    @Published var isFinished = false
     
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        setupCamera()
-        setupObjectDetection()
-    }
-    
-    func setupCamera() {
-        // Set up camera capture session
-        captureSession = AVCaptureSession()
-        captureSession.sessionPreset = .high
+    func startListening() {
+        guard !isFinished else { return }
         
-        guard let videoCaptureDevice = AVCaptureDevice.default(for: .video) else { return }
-        let videoInput: AVCaptureDeviceInput
-        
-        do {
-            videoInput = try AVCaptureDeviceInput(device: videoCaptureDevice)
-        } catch {
-            return
-        }
-        
-        if (captureSession.canAddInput(videoInput)) {
-            captureSession.addInput(videoInput)
-        } else {
-            return
-        }
-        
-        // Set up camera preview layer
-        previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
-        previewLayer.frame = view.layer.bounds
-        previewLayer.videoGravity = .resizeAspectFill
-        view.layer.addSublayer(previewLayer)
-        
-        // Set up video output
-        let videoOutput = AVCaptureVideoDataOutput()
-        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
-        captureSession.addOutput(videoOutput)
-        
-        captureSession.startRunning()
-    }
-    
-    func setupObjectDetection() {
-        // Load the Core ML model
-        guard let model = try? VNCoreMLModel(for: YOLOv3().model) else { return } // Replace 'YOLOv3' with your model class name
-        
-        // Create a Vision request for the model
-        objectDetectionRequest = VNCoreMLRequest(model: model) { (request, error) in
-            guard let results = request.results as? [VNRecognizedObjectObservation] else { return }
+        SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
-                self.view.layer.sublayers?.removeSubrange(1...) // Clear previous boxes
-                for result in results {
-                    self.drawBoundingBox(for: result)
+                if authStatus == .authorized {
+                    do {
+                        try self.startRecording()
+                        self.isListening = true
+                        self.speak("What would you like to find today?")
+                    } catch {
+                        print("Failed to start recording: \(error)")
+                    }
+                } else {
+                    print("Speech recognition not authorized")
                 }
             }
         }
-        
-        objectDetectionRequest.imageCropAndScaleOption = .scaleFill
     }
     
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        try? handler.perform([objectDetectionRequest])
+    func stopListening() {
+        audioEngine.stop()
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        self.isListening = false
+        silenceTimer?.invalidate()
     }
     
-    func drawBoundingBox(for observation: VNRecognizedObjectObservation) {
-        let boundingBox = observation.boundingBox
-        let size = CGSize(width: boundingBox.width * view.bounds.width,
-                          height: boundingBox.height * view.bounds.height)
-        let origin = CGPoint(x: boundingBox.minX * view.bounds.width,
-                             y: (1 - boundingBox.minY) * view.bounds.height - size.height)
-        let boxLayer = CALayer()
-        boxLayer.frame = CGRect(origin: origin, size: size)
-        boxLayer.borderWidth = 2
-        boxLayer.borderColor = UIColor.red.cgColor
-        view.layer.addSublayer(boxLayer)
+    private func startRecording() throws {
+        recognitionTask?.cancel()
+        self.recognitionTask = nil
+        
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playAndRecord, mode: .default, options: .defaultToSpeaker)
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        
+        let inputNode = audioEngine.inputNode
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        guard let recognitionRequest = recognitionRequest else { fatalError("Unable to create a SFSpeechAudioBufferRecognitionRequest object") }
+        recognitionRequest.shouldReportPartialResults = true
+        
+        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { result, error in
+            var isFinal = false
+            if let result = result {
+                self.recognizedText = result.bestTranscription.formattedString
+                isFinal = result.isFinal
+                self.resetSilenceTimer()
+            }
+            
+            if error != nil || isFinal {
+                self.audioEngine.stop()
+                inputNode.removeTap(onBus: 0)
+                self.recognitionRequest = nil
+                self.recognitionTask = nil
+                self.interpretCommand()
+            }
+        }
+        
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
+            self.recognitionRequest?.append(buffer)
+        }
+        
+        audioEngine.prepare()
+        try audioEngine.start()
+        
+        resetSilenceTimer()
+    }
+    
+    private func resetSilenceTimer() {
+        silenceTimer?.invalidate()
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
+            self.stopListening()
+            self.interpretCommand()
+        }
+    }
+    
+    private func interpretCommand() {
+        let lowercasedText = recognizedText.lowercased()
+        
+        if lowercasedText.contains("bottle") || lowercasedText.contains("water") {
+            selectedOption = .bottle
+        } else if lowercasedText.contains("backpack") || lowercasedText.contains("bag") {
+            selectedOption = .backpack
+        } else if lowercasedText.contains("cellphone") || lowercasedText.contains("phone") || lowercasedText.contains("mobile") {
+            selectedOption = .cellphone
+        }
+        
+        if let option = selectedOption {
+            speak("Got it. Searching for \(option.rawValue) now.")
+            isFinished = true
+        } else {
+            speak("Sorry, I didn't catch that. Please try again.")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                self.recognizedText = ""
+                self.startListening()
+            }
+        }
+    }
+    
+    func speak(_ text: String) {
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        synthesizer.speak(utterance)
+    }
+    
+    func reset() {
+        isFinished = false
+        selectedOption = nil
+        recognizedText = ""
+        startListening()
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var speechRecognizer = SpeechRecognizer()
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Voice Command Object Finder")
+                .font(.largeTitle)
+            
+            ForEach(FindOption.allCases, id: \.self) { option in
+                Text(option.rawValue.capitalized)
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(speechRecognizer.selectedOption == option ? Color.blue : Color.gray)
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+            }
+            
+            Button(action: {
+                speechRecognizer.reset()
+            }) {
+                Text("Reset")
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color.green)
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+            }
+            
+            Text("Status: \(speechRecognizer.isListening ? "Listening" : (speechRecognizer.isFinished ? "Finished" : "Idle"))")
+                .padding()
+            
+            Text("Recognized: \(speechRecognizer.recognizedText)")
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.gray.opacity(0.2))
+                .cornerRadius(10)
+        }
+        .padding()
+        .onAppear {
+            speechRecognizer.startListening()
+        }
     }
 }
