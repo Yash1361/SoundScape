@@ -1,18 +1,54 @@
 import SwiftUI
 import Vision
 import ARKit
+import SceneKit
 
-class ARModel: NSObject, ObservableObject, ARSessionDelegate {
+class TargetAnchor: ARAnchor {
+    var objectName: String
+    
+    override init(name: String, transform: simd_float4x4) {
+        self.objectName = name
+        super.init(name: name, transform: transform)
+    }
+    
+    required init(anchor: ARAnchor) {
+        self.objectName = anchor.name ?? "Unknown"
+        super.init(anchor: anchor)
+    }
+    
+    required init?(coder aDecoder: NSCoder) {
+        self.objectName = aDecoder.decodeObject(forKey: "objectName") as? String ?? "Unknown"
+        super.init(coder: aDecoder)
+    }
+    
+    override func encode(with aCoder: NSCoder) {
+        super.encode(with: aCoder)
+        aCoder.encode(objectName, forKey: "objectName")
+    }
+    
+    override class var supportsSecureCoding: Bool {
+        return true
+    }
+}
+
+class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     @Published var isDetecting = false
-    @Published var detectedObjects: [DetectedObject] = []
+    @Published var targetObject: String?
+    @Published var availableObjects: [String] = []
+    @Published var hasFoundTargetObject = false
+    @Published var targetNodeVisible = false
+    @Published var targetObjectScreenPosition: CGPoint?
+    @Published var targetObjectScreenSize: CGSize?
     
     var arView: ARSCNView!
     private var detectionRequest: VNCoreMLRequest?
     private var visionModel: VNCoreMLModel?
+    private var targetNode: SCNNode?
     
     override init() {
         super.init()
         setupVision()
+        loadAvailableObjects()
     }
     
     func setupVision() {
@@ -24,11 +60,41 @@ class ARModel: NSObject, ObservableObject, ARSessionDelegate {
         detectionRequest?.imageCropAndScaleOption = .scaleFill
     }
     
+    func loadAvailableObjects() {
+        availableObjects = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"].sorted()
+    }
+    
     func startSession() {
         let configuration = ARWorldTrackingConfiguration()
         configuration.planeDetection = [.horizontal, .vertical]
-        arView.session.delegate = self
         arView.session.run(configuration)
+        arView.delegate = self
+        arView.session.delegate = self
+    }
+    
+    func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
+        guard let pointOfView = arView.pointOfView else { return }
+        
+        if let targetNode = targetNode {
+            let targetPosition = targetNode.simdWorldPosition
+            let cameraPosition = pointOfView.simdWorldPosition
+            
+            let distance = simd_distance(targetPosition, cameraPosition)
+            
+            let projectedPoint = arView.projectPoint(SCNVector3(targetPosition))
+            let screenPoint = CGPoint(x: CGFloat(projectedPoint.x), y: CGFloat(projectedPoint.y))
+            
+            let size = 0.2 / distance // Adjust this factor to change the size of the bounding box
+            let screenSize = CGSize(width: CGFloat(size * 100), height: CGFloat(size * 100))
+            
+            let isOnScreen = arView.bounds.contains(screenPoint)
+            
+            DispatchQueue.main.async {
+                self.targetNodeVisible = isOnScreen
+                self.targetObjectScreenPosition = screenPoint
+                self.targetObjectScreenSize = screenSize
+            }
+        }
     }
     
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
@@ -44,57 +110,94 @@ class ARModel: NSObject, ObservableObject, ARSessionDelegate {
     }
     
     func handleDetections(request: VNRequest, error: Error?) {
-        DispatchQueue.main.async {
-            self.detectedObjects = []
-            guard let results = request.results as? [VNRecognizedObjectObservation] else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let results = request.results as? [VNRecognizedObjectObservation] else { return }
             
             for observation in results {
-                let bbox = observation.boundingBox
                 let className = observation.labels[0].identifier
-                let confidence = observation.confidence
-                
-                if let distance = self.calculateAccurateDistance(for: bbox) {
-                    let object = DetectedObject(bbox: bbox,
-                                                className: className,
-                                                score: Float(confidence),
-                                                distance: distance)
-                    self.detectedObjects.append(object)
+                if className == self.targetObject {
+                    self.foundTargetObject(observation: observation)
+                    return
                 }
             }
         }
     }
     
-    func calculateAccurateDistance(for bbox: CGRect) -> Float? {
-        guard let currentFrame = arView.session.currentFrame else { return nil }
+    func foundTargetObject(observation: VNRecognizedObjectObservation) {
+        guard let currentFrame = arView.session.currentFrame else { return }
         
+        let bbox = observation.boundingBox
         let viewportSize = arView.bounds.size
         let viewportPoint = CGPoint(x: bbox.midX * viewportSize.width,
                                     y: bbox.midY * viewportSize.height)
         
         guard let query = arView.raycastQuery(from: viewportPoint,
                                               allowing: .estimatedPlane,
-                                              alignment: .any) else { return nil }
+                                              alignment: .any) else { return }
         
-        guard let result = arView.session.raycast(query).first else { return nil }
+        guard let result = arView.session.raycast(query).first else { return }
         
-        let worldPosition = result.worldTransform.columns.3
-        let cameraPosition = currentFrame.camera.transform.columns.3
+        let anchor = TargetAnchor(name: targetObject ?? "Unknown", transform: result.worldTransform)
+        arView.session.add(anchor: anchor)
         
-        let distance = simd_distance(worldPosition, cameraPosition)
-        return distance
+        let node = createTargetNode()
+        node.simdTransform = result.worldTransform
+        arView.scene.rootNode.addChildNode(node)
+        targetNode = node
+        
+        hasFoundTargetObject = true
+        isDetecting = false
+    }
+    
+    func createTargetNode() -> SCNNode {
+        let boxGeometry = SCNBox(width: 0.1, height: 0.1, length: 0.1, chamferRadius: 0)
+        let material = SCNMaterial()
+        material.diffuse.contents = UIColor.green.withAlphaComponent(0.7)
+        boxGeometry.materials = [material]
+        
+        let node = SCNNode(geometry: boxGeometry)
+        node.name = "TargetNode"
+        
+        return node
+    }
+    
+    func reset() {
+        hasFoundTargetObject = false
+        targetObject = nil
+        isDetecting = false
+        targetNodeVisible = false
+        targetObjectScreenPosition = nil
+        targetObjectScreenSize = nil
+        
+        if let targetNode = targetNode {
+            targetNode.removeFromParentNode()
+        }
+        targetNode = nil
+        
+        if let targetAnchor = arView.session.currentFrame?.anchors.compactMap({ $0 as? TargetAnchor }).first {
+            arView.session.remove(anchor: targetAnchor)
+        }
+        
+        startSession()
     }
 }
 
-struct DetectedObject: Identifiable {
-    let id = UUID()
-    let bbox: CGRect
-    let className: String
-    let score: Float
-    let distance: Float
+extension ARModel: ARSessionDelegate {
+    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        for anchor in anchors {
+            if let targetAnchor = anchor as? TargetAnchor {
+                let node = createTargetNode()
+                node.simdTransform = targetAnchor.transform
+                arView.scene.rootNode.addChildNode(node)
+                targetNode = node
+            }
+        }
+    }
 }
 
 struct ContentView: View {
     @StateObject private var arModel = ARModel()
+    @State private var showingObjectPicker = false
     
     var body: some View {
         ZStack {
@@ -102,22 +205,77 @@ struct ContentView: View {
                 .edgesIgnoringSafeArea(.all)
             
             VStack {
-                Spacer()
-                Button(action: {
-                    arModel.isDetecting.toggle()
-                }) {
-                    Text(arModel.isDetecting ? "Stop Detection" : "Start Detection")
+                if !arModel.hasFoundTargetObject {
+                    if !arModel.isDetecting {
+                        Button(action: {
+                            showingObjectPicker = true
+                        }) {
+                            Text("Find Item")
+                                .padding()
+                                .background(Color.blue)
+                                .foregroundColor(.white)
+                                .cornerRadius(10)
+                        }
+                        .padding(.top)
+                    }
+                    
+                    Spacer()
+                    
+                    Button(action: {
+                        arModel.isDetecting.toggle()
+                    }) {
+                        Text(arModel.isDetecting ? "Stop Detection" : "Start Detection")
+                            .padding()
+                            .background(Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
+                    .padding(.bottom)
+                } else {
+                    Text("Target object found!")
+                        .font(.headline)
                         .padding()
-                        .background(Color.blue)
+                        .background(Color.green)
                         .foregroundColor(.white)
                         .cornerRadius(10)
+                        .padding(.top)
+                    
+                    if arModel.targetNodeVisible {
+                        Text("Target object visible")
+                            .font(.subheadline)
+                            .padding()
+                            .background(Color.yellow)
+                            .foregroundColor(.black)
+                            .cornerRadius(10)
+                            .padding(.top)
+                    }
+                    
+                    Spacer()
+                    
+                    Button(action: {
+                        arModel.reset()
+                    }) {
+                        Text("Reset")
+                            .padding()
+                            .background(Color.red)
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
+                    .padding(.bottom)
                 }
-                .padding(.bottom)
             }
             
-            ForEach(arModel.detectedObjects) { object in
-                ObjectBox(object: object)
+            if let position = arModel.targetObjectScreenPosition,
+               let size = arModel.targetObjectScreenSize,
+               arModel.targetNodeVisible {
+                Rectangle()
+                    .stroke(Color.green, lineWidth: 2)
+                    .frame(width: size.width, height: size.height)
+                    .position(position)
             }
+        }
+        .sheet(isPresented: $showingObjectPicker) {
+            ObjectPickerView(arModel: arModel)
         }
     }
 }
@@ -135,30 +293,21 @@ struct ARViewContainer: UIViewRepresentable {
     func updateUIView(_ uiView: ARSCNView, context: Context) {}
 }
 
-struct ObjectBox: View {
-    let object: DetectedObject
+struct ObjectPickerView: View {
+    @ObservedObject var arModel: ARModel
+    @Environment(\.presentationMode) var presentationMode
     
     var body: some View {
-        GeometryReader { geometry in
-            let rect = CGRect(
-                x: object.bbox.minX * geometry.size.width,
-                y: object.bbox.minY * geometry.size.height,
-                width: object.bbox.width * geometry.size.width,
-                height: object.bbox.height * geometry.size.height
-            )
-            
-            Rectangle()
-                .stroke(Color.red, lineWidth: 2)
-                .frame(width: rect.width, height: rect.height)
-                .position(x: rect.midX, y: rect.midY)
-            
-            Text("\(object.className) - \(String(format: "%.2f", object.distance))m")
-                .font(.caption)
-                .foregroundColor(.white)
-                .padding(4)
-                .background(Color.black.opacity(0.7))
-                .cornerRadius(4)
-                .position(x: rect.minX, y: rect.minY - 10)
+        NavigationView {
+            List(arModel.availableObjects, id: \.self) { object in
+                Button(action: {
+                    arModel.targetObject = object
+                    presentationMode.wrappedValue.dismiss()
+                }) {
+                    Text(object)
+                }
+            }
+            .navigationTitle("Select Target Object")
         }
     }
 }
