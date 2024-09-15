@@ -53,6 +53,11 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     private var audioFile: AVAudioFile!
     private var pannerNode: AVAudioMixerNode!
     
+    // Inside ARModel class
+
+    private var beepTimer: Timer?
+
+    
     override init() {
         super.init()
         setupVision()
@@ -121,25 +126,32 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     }
     func startAudio() {
         guard let audioFile = audioFile else { return }
-        
+
         do {
             // Start the audio engine before scheduling and playing audio
             if !audioEngine.isRunning {
                 try audioEngine.start()
+                print("Audio engine started")
             }
         } catch {
             print("Unable to start audio engine: \(error)")
             return
         }
-        
-        // Schedule the audio file
-        audioPlayerNode.scheduleFile(audioFile, at: nil) { [weak self] in
-            self?.scheduleNextLoop()
-        }
-        
-        // Start playback
+
+        // Start playback immediately
         audioPlayerNode.play()
+
+        // Schedule beeps via Timer with desired interval (e.g., 1 second)
+        beepTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.audioPlayerNode.stop()
+            self.audioPlayerNode.scheduleFile(self.audioFile, at: nil, completionHandler: nil)
+            self.audioPlayerNode.play()
+        }
+
+        print("Audio playback started with beep interval of 1 second")
     }
+
 
     
     func scheduleNextLoop() {
@@ -164,9 +176,14 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
         audioPlayerNode.stop()
         if audioEngine.isRunning {
             audioEngine.stop()
+            print("Audio engine stopped")
         }
         audioEngine.reset()
+        beepTimer?.invalidate()
+        beepTimer = nil
+        print("Audio playback stopped and Timer invalidated")
     }
+
 
     
     func updateAudioPosition(targetPosition: simd_float3, listenerPosition: simd_float3, listenerForward: simd_float3) {
