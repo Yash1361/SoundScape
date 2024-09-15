@@ -51,7 +51,7 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     private var audioEngine: AVAudioEngine!
     private var audioPlayerNode: AVAudioPlayerNode!
     private var audioFile: AVAudioFile!
-    private var environmentNode: AVAudioEnvironmentNode!
+    private var stereoPanner: AVAudioUnitEQ!
     
     override init() {
         super.init()
@@ -76,13 +76,13 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     func setupAudio() {
         audioEngine = AVAudioEngine()
         audioPlayerNode = AVAudioPlayerNode()
-        environmentNode = AVAudioEnvironmentNode()
+        stereoPanner = AVAudioUnitEQ(numberOfBands: 1)
         
         audioEngine.attach(audioPlayerNode)
-        audioEngine.attach(environmentNode)
+        audioEngine.attach(stereoPanner)
         
-        audioEngine.connect(audioPlayerNode, to: environmentNode, format: nil)
-        audioEngine.connect(environmentNode, to: audioEngine.mainMixerNode, format: nil)
+        audioEngine.connect(audioPlayerNode, to: stereoPanner, format: nil)
+        audioEngine.connect(stereoPanner, to: audioEngine.mainMixerNode, format: nil)
         
         guard let url = Bundle.main.url(forResource: "continuousSound", withExtension: "wav") else {
             print("Unable to find sound file")
@@ -125,21 +125,36 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
         audioEngine.stop()
     }
     
-    func updateAudioPosition(targetPosition: simd_float3, listenerPosition: simd_float3) {
+    func updateAudioPosition(targetPosition: simd_float3, listenerPosition: simd_float3, listenerForward: simd_float3) {
         let relativePosition = targetPosition - listenerPosition
-        environmentNode.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
-        audioPlayerNode.position = AVAudio3DPoint(x: relativePosition.x, y: relativePosition.y, z: relativePosition.z)
-        
         let distance = simd_length(relativePosition)
+        
+        // Calculate volume based on distance
         let volume: Float
-        if distance <= 0.45 {
+        if distance <= 0.5 {
             volume = 1.0
-        } else if distance >= 1.0 {
+        } else if distance >= 6.0 {
             volume = 0.1
         } else {
-            volume = 1.0 - ((distance - 0.45) / 0.55) * 0.9
+            volume = 1.0 - ((distance - 0.5) / 5.5) * 0.9
         }
         audioPlayerNode.volume = volume
+        
+        // Calculate pan based on relative position
+        let right = simd_cross(listenerForward, [0, 1, 0])
+        let forward = simd_normalize(simd_make_float3(listenerForward.x, 0, listenerForward.z))
+        let relativeDirection = simd_normalize(simd_make_float3(relativePosition.x, 0, relativePosition.z))
+        
+        let forwardProjection = simd_dot(relativeDirection, forward)
+        let rightProjection = simd_dot(relativeDirection, right)
+        
+        let angle = atan2(rightProjection, forwardProjection)
+        let pan = Float(angle) / (.pi / 2)
+        
+        stereoPanner.bands[0].frequency = 0
+        stereoPanner.bands[0].bypass = false
+        stereoPanner.bands[0].filterType = .parametric
+        stereoPanner.bands[0].gain = pan * 100 // Adjust this multiplier to control the intensity of the panning effect
     }
     
     func startSession() {
@@ -157,6 +172,7 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
         if let targetNode = targetNode {
             let targetPosition = targetNode.simdWorldPosition
             let cameraPosition = pointOfView.simdWorldPosition
+            let cameraForward = pointOfView.simdWorldFront
             
             let distance = simd_distance(targetPosition, cameraPosition)
             
@@ -168,7 +184,7 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
             
             let isOnScreen = arView.bounds.contains(screenPoint)
             
-            updateAudioPosition(targetPosition: targetPosition, listenerPosition: cameraPosition)
+            updateAudioPosition(targetPosition: targetPosition, listenerPosition: cameraPosition, listenerForward: cameraForward)
             
             DispatchQueue.main.async {
                 self.targetNodeVisible = isOnScreen
