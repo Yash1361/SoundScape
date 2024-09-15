@@ -2,6 +2,7 @@ import SwiftUI
 import Vision
 import ARKit
 import SceneKit
+import AVFoundation
 
 class TargetAnchor: ARAnchor {
     var objectName: String
@@ -46,10 +47,17 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     private var visionModel: VNCoreMLModel?
     private var targetNode: SCNNode?
     
+    // Audio properties
+    private var audioEngine: AVAudioEngine!
+    private var audioPlayerNode: AVAudioPlayerNode!
+    private var audioFile: AVAudioFile!
+    private var environmentNode: AVAudioEnvironmentNode!
+    
     override init() {
         super.init()
         setupVision()
         loadAvailableObjects()
+        setupAudio()
     }
     
     func setupVision() {
@@ -63,6 +71,75 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     
     func loadAvailableObjects() {
         availableObjects = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"].sorted()
+    }
+    
+    func setupAudio() {
+        audioEngine = AVAudioEngine()
+        audioPlayerNode = AVAudioPlayerNode()
+        environmentNode = AVAudioEnvironmentNode()
+        
+        audioEngine.attach(audioPlayerNode)
+        audioEngine.attach(environmentNode)
+        
+        audioEngine.connect(audioPlayerNode, to: environmentNode, format: nil)
+        audioEngine.connect(environmentNode, to: audioEngine.mainMixerNode, format: nil)
+        
+        guard let url = Bundle.main.url(forResource: "continuousSound", withExtension: "wav") else {
+            print("Unable to find sound file")
+            return
+        }
+        
+        do {
+            audioFile = try AVAudioFile(forReading: url)
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            print("Error setting up audio: \(error.localizedDescription)")
+        }
+    }
+    
+    func startAudio() {
+        guard let audioFile = audioFile else { return }
+        
+        audioPlayerNode.scheduleFile(audioFile, at: nil) { [weak self] in
+            self?.scheduleNextLoop()
+        }
+        audioPlayerNode.play()
+        
+        do {
+            try audioEngine.start()
+        } catch {
+            print("Unable to start audio engine: \(error)")
+        }
+    }
+    
+    func scheduleNextLoop() {
+        guard let audioFile = audioFile else { return }
+        audioPlayerNode.scheduleFile(audioFile, at: nil) { [weak self] in
+            self?.scheduleNextLoop()
+        }
+    }
+    
+    func stopAudio() {
+        audioPlayerNode.stop()
+        audioEngine.stop()
+    }
+    
+    func updateAudioPosition(targetPosition: simd_float3, listenerPosition: simd_float3) {
+        let relativePosition = targetPosition - listenerPosition
+        environmentNode.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
+        audioPlayerNode.position = AVAudio3DPoint(x: relativePosition.x, y: relativePosition.y, z: relativePosition.z)
+        
+        let distance = simd_length(relativePosition)
+        let volume: Float
+        if distance <= 0.45 {
+            volume = 1.0
+        } else if distance >= 1.0 {
+            volume = 0.1
+        } else {
+            volume = 1.0 - ((distance - 0.45) / 0.55) * 0.9
+        }
+        audioPlayerNode.volume = volume
     }
     
     func startSession() {
@@ -91,10 +168,13 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
             
             let isOnScreen = arView.bounds.contains(screenPoint)
             
+            updateAudioPosition(targetPosition: targetPosition, listenerPosition: cameraPosition)
+            
             DispatchQueue.main.async {
                 self.targetNodeVisible = isOnScreen
                 self.targetObjectScreenPosition = screenPoint
                 self.targetObjectScreenSize = screenSize
+                self.targetObjectDistance = distance
             }
         }
     }
@@ -108,47 +188,6 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
             } catch {
                 print("Failed to perform detection: \(error)")
             }
-        } else if hasFoundTargetObject {
-            updateTargetDistance(frame: frame)
-        }
-    }
-    
-    func updateTargetDistance(frame: ARFrame) {
-        guard let targetNode = targetNode,
-              let sceneDepth = frame.sceneDepth,
-              let devicePosition = arView.pointOfView?.simdWorldPosition else { return }
-        
-        let targetPosition = targetNode.simdWorldPosition
-        
-        let projectedPoint = arView.projectPoint(SCNVector3(targetPosition))
-        
-        let depthWidth = CGFloat(CVPixelBufferGetWidth(sceneDepth.depthMap))
-        let depthHeight = CGFloat(CVPixelBufferGetHeight(sceneDepth.depthMap))
-        
-        let scaleX = depthWidth / frame.camera.imageResolution.width
-        let scaleY = depthHeight / frame.camera.imageResolution.height
-        
-        let depthX = Int(CGFloat(projectedPoint.x) * scaleX)
-        let depthY = Int(CGFloat(projectedPoint.y) * scaleY)
-        
-        guard depthX >= 0 && depthX < Int(depthWidth) &&
-              depthY >= 0 && depthY < Int(depthHeight) else { return }
-        
-        CVPixelBufferLockBaseAddress(sceneDepth.depthMap, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(sceneDepth.depthMap, .readOnly) }
-        
-        guard let depthPointer = CVPixelBufferGetBaseAddress(sceneDepth.depthMap)?.assumingMemoryBound(to: Float32.self) else {
-            return
-        }
-        
-        let depthValue = depthPointer[depthY * Int(depthWidth) + depthX]
-        
-        let depthInMeters = depthValue
-        
-        let distance = simd_distance(devicePosition, targetPosition)
-        
-        DispatchQueue.main.async {
-            self.targetObjectDistance = distance
         }
     }
     
@@ -190,6 +229,7 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
         
         hasFoundTargetObject = true
         isDetecting = false
+        startAudio()
     }
     
     func createTargetNode() -> SCNNode {
@@ -222,22 +262,12 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
             arView.session.remove(anchor: targetAnchor)
         }
         
+        stopAudio()
         startSession()
     }
 }
 
-extension ARModel: ARSessionDelegate {
-    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-        for anchor in anchors {
-            if let targetAnchor = anchor as? TargetAnchor {
-                let node = createTargetNode()
-                node.simdTransform = targetAnchor.transform
-                arView.scene.rootNode.addChildNode(node)
-                targetNode = node
-            }
-        }
-    }
-}
+extension ARModel: ARSessionDelegate {}
 
 struct ContentView: View {
     @StateObject private var arModel = ARModel()
