@@ -51,7 +51,7 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     private var audioEngine: AVAudioEngine!
     private var audioPlayerNode: AVAudioPlayerNode!
     private var audioFile: AVAudioFile!
-    private var stereoPanner: AVAudioUnitEQ!
+    private var pannerNode: AVAudioMixerNode!
     
     override init() {
         super.init()
@@ -76,13 +76,13 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     func setupAudio() {
         audioEngine = AVAudioEngine()
         audioPlayerNode = AVAudioPlayerNode()
-        stereoPanner = AVAudioUnitEQ(numberOfBands: 1)
+        pannerNode = AVAudioMixerNode()
         
         audioEngine.attach(audioPlayerNode)
-        audioEngine.attach(stereoPanner)
+        audioEngine.attach(pannerNode)
         
-        audioEngine.connect(audioPlayerNode, to: stereoPanner, format: nil)
-        audioEngine.connect(stereoPanner, to: audioEngine.mainMixerNode, format: nil)
+        audioEngine.connect(audioPlayerNode, to: pannerNode, format: nil)
+        audioEngine.connect(pannerNode, to: audioEngine.mainMixerNode, format: nil)
         
         guard let url = Bundle.main.url(forResource: "continuousSound", withExtension: "wav") else {
             print("Unable to find sound file")
@@ -91,70 +91,123 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
         
         do {
             audioFile = try AVAudioFile(forReading: url)
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
-            try AVAudioSession.sharedInstance().setActive(true)
+            
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .default)
+            try audioSession.setActive(true)
+            
+            // Prepare the audio engine
+            audioEngine.prepare()
+            
+            print("Audio setup completed successfully")
         } catch {
             print("Error setting up audio: \(error.localizedDescription)")
+            
+            if let err = error as? AVAudioSession.ErrorCode {
+                print("AVAudioSession error code: \(err.rawValue)")
+            }
+            
+            if let err = error as NSError? {
+                print("Error code: \(err.code)")
+                print("Error domain: \(err.domain)")
+                if let failureReason = err.localizedFailureReason {
+                    print("Failure reason: \(failureReason)")
+                }
+                if let recoverySuggestion = err.localizedRecoverySuggestion {
+                    print("Recovery suggestion: \(recoverySuggestion)")
+                }
+            }
         }
     }
-    
     func startAudio() {
         guard let audioFile = audioFile else { return }
         
+        do {
+            // Start the audio engine before scheduling and playing audio
+            if !audioEngine.isRunning {
+                try audioEngine.start()
+            }
+        } catch {
+            print("Unable to start audio engine: \(error)")
+            return
+        }
+        
+        // Schedule the audio file
         audioPlayerNode.scheduleFile(audioFile, at: nil) { [weak self] in
             self?.scheduleNextLoop()
         }
-        audioPlayerNode.play()
         
-        do {
-            try audioEngine.start()
-        } catch {
-            print("Unable to start audio engine: \(error)")
-        }
+        // Start playback
+        audioPlayerNode.play()
     }
+
     
     func scheduleNextLoop() {
         guard let audioFile = audioFile else { return }
+        
+        if !audioEngine.isRunning {
+            do {
+                try audioEngine.start()
+            } catch {
+                print("Unable to start audio engine: \(error)")
+                return
+            }
+        }
+        
         audioPlayerNode.scheduleFile(audioFile, at: nil) { [weak self] in
             self?.scheduleNextLoop()
         }
     }
+
     
     func stopAudio() {
         audioPlayerNode.stop()
-        audioEngine.stop()
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.reset()
     }
+
     
     func updateAudioPosition(targetPosition: simd_float3, listenerPosition: simd_float3, listenerForward: simd_float3) {
         let relativePosition = targetPosition - listenerPosition
         let distance = simd_length(relativePosition)
         
-        // Calculate volume based on distance
-        let volume: Float
-        if distance <= 0.5 {
-            volume = 1.0
-        } else if distance >= 6.0 {
-            volume = 0.1
-        } else {
-            volume = 1.0 - ((distance - 0.5) / 5.5) * 0.9
-        }
-        audioPlayerNode.volume = volume
-        
-        // Calculate pan based on relative position
-        let right = simd_cross(listenerForward, [0, 1, 0])
+        // Calculate direction vectors
         let forward = simd_normalize(simd_make_float3(listenerForward.x, 0, listenerForward.z))
+        let right = simd_cross(forward, [0, 1, 0])
         let relativeDirection = simd_normalize(simd_make_float3(relativePosition.x, 0, relativePosition.z))
         
-        let forwardProjection = simd_dot(relativeDirection, forward)
-        let rightProjection = simd_dot(relativeDirection, right)
+        // Calculate angle between forward direction and object direction
+        let dotProduct = simd_dot(forward, relativeDirection)
+        let angle = acos(dotProduct)
         
-        let angle = atan2(rightProjection, forwardProjection)
-        let pan = Float(angle) / (.pi / 2)
+        // Determine if object is to the left or right
+        let rightDotProduct = simd_dot(right, relativeDirection)
+        let sign = rightDotProduct >= 0 ? 1.0 : -1.0
         
-        stereoPanner.bands[0].frequency = 0
-        stereoPanner.bands[0].bypass = false
-        stereoPanner.bands[0].filterType = .parametric
-        stereoPanner.bands[0].gain = pan * 100 // Adjust this multiplier to control the intensity of the panning effect
+        // Calculate pan
+        let pan = Float(sign) * sin(angle)
+        
+        // Calculate volume based on angle and distance
+        let baseVolume: Float
+        if distance <= 0.5 {
+            baseVolume = 1.0
+        } else if distance >= 6.0 {
+            baseVolume = 0.1
+        } else {
+            baseVolume = 1.0 - ((distance - 0.5) / 5.5) * 0.9
+        }
+        
+        // Reduce volume when object is behind the user
+        let angleAttenuation = cos(angle / 2) // This will be 1 when directly in front, 0 when directly behind
+        let volume = baseVolume * max(0.1, angleAttenuation) // Ensure there's always some audible sound
+        
+        // Apply volume and pan
+        audioPlayerNode.volume = volume
+        pannerNode.pan = pan
+        
+        print("Debug: Angle: \(angle), Pan: \(pan), Volume: \(volume)")
     }
     
     func startSession() {
