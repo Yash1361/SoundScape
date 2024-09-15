@@ -39,6 +39,7 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     @Published var targetNodeVisible = false
     @Published var targetObjectScreenPosition: CGPoint?
     @Published var targetObjectScreenSize: CGSize?
+    @Published var targetObjectDistance: Float?
     
     var arView: ARSCNView!
     private var detectionRequest: VNCoreMLRequest?
@@ -67,6 +68,7 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     func startSession() {
         let configuration = ARWorldTrackingConfiguration()
         configuration.planeDetection = [.horizontal, .vertical]
+        configuration.frameSemantics.insert(.sceneDepth)
         arView.session.run(configuration)
         arView.delegate = self
         arView.session.delegate = self
@@ -84,8 +86,8 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
             let projectedPoint = arView.projectPoint(SCNVector3(targetPosition))
             let screenPoint = CGPoint(x: CGFloat(projectedPoint.x), y: CGFloat(projectedPoint.y))
             
-            let size = 0.2 / distance // Adjust this factor to change the size of the bounding box
-            let screenSize = CGSize(width: CGFloat(size * 100), height: CGFloat(size * 100))
+            let size = CGFloat(0.2 / distance)
+            let screenSize = CGSize(width: size * 100, height: size * 100)
             
             let isOnScreen = arView.bounds.contains(screenPoint)
             
@@ -98,14 +100,55 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
     }
     
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        guard isDetecting else { return }
+        if isDetecting {
+            let pixelBuffer = frame.capturedImage
+            let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+            do {
+                try imageRequestHandler.perform([detectionRequest!])
+            } catch {
+                print("Failed to perform detection: \(error)")
+            }
+        } else if hasFoundTargetObject {
+            updateTargetDistance(frame: frame)
+        }
+    }
+    
+    func updateTargetDistance(frame: ARFrame) {
+        guard let targetNode = targetNode,
+              let sceneDepth = frame.sceneDepth,
+              let devicePosition = arView.pointOfView?.simdWorldPosition else { return }
         
-        let pixelBuffer = frame.capturedImage
-        let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
-        do {
-            try imageRequestHandler.perform([detectionRequest!])
-        } catch {
-            print("Failed to perform detection: \(error)")
+        let targetPosition = targetNode.simdWorldPosition
+        
+        let projectedPoint = arView.projectPoint(SCNVector3(targetPosition))
+        
+        let depthWidth = CGFloat(CVPixelBufferGetWidth(sceneDepth.depthMap))
+        let depthHeight = CGFloat(CVPixelBufferGetHeight(sceneDepth.depthMap))
+        
+        let scaleX = depthWidth / frame.camera.imageResolution.width
+        let scaleY = depthHeight / frame.camera.imageResolution.height
+        
+        let depthX = Int(CGFloat(projectedPoint.x) * scaleX)
+        let depthY = Int(CGFloat(projectedPoint.y) * scaleY)
+        
+        guard depthX >= 0 && depthX < Int(depthWidth) &&
+              depthY >= 0 && depthY < Int(depthHeight) else { return }
+        
+        CVPixelBufferLockBaseAddress(sceneDepth.depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(sceneDepth.depthMap, .readOnly) }
+        
+        guard let depthPointer = CVPixelBufferGetBaseAddress(sceneDepth.depthMap)?.assumingMemoryBound(to: Float32.self) else {
+            return
+        }
+        
+        let depthValue = depthPointer[depthY * Int(depthWidth) + depthX]
+        
+        let depthInMeters = depthValue
+        
+        let distance = simd_distance(devicePosition, targetPosition)
+        
+        DispatchQueue.main.async {
+            self.targetObjectDistance = distance
         }
     }
     
@@ -168,6 +211,7 @@ class ARModel: NSObject, ObservableObject, ARSCNViewDelegate {
         targetNodeVisible = false
         targetObjectScreenPosition = nil
         targetObjectScreenSize = nil
+        targetObjectDistance = nil
         
         if let targetNode = targetNode {
             targetNode.removeFromParentNode()
@@ -246,6 +290,16 @@ struct ContentView: View {
                             .padding()
                             .background(Color.yellow)
                             .foregroundColor(.black)
+                            .cornerRadius(10)
+                            .padding(.top)
+                    }
+                    
+                    if let distance = arModel.targetObjectDistance {
+                        Text(String(format: "Distance: %.2f meters", distance))
+                            .font(.subheadline)
+                            .padding()
+                            .background(Color.blue)
+                            .foregroundColor(.white)
                             .cornerRadius(10)
                             .padding(.top)
                     }
