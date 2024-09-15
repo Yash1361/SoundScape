@@ -62,8 +62,8 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
     private var guideBuffer: AVAudioPCMBuffer?
     private var obstacleBuffer: AVAudioPCMBuffer?
     
-    private var happyPlayerNode: AVAudioPlayerNode!
-        private var happyBuffer: AVAudioPCMBuffer?
+    private let obstacleDetectionInterval: TimeInterval = 0.1 // New property for detection interval
+
     
     // Obstacle detection properties
     private var obstacleDetectionTimer: Timer?
@@ -105,62 +105,72 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
         audioEngine = AVAudioEngine()
         guidePlayerNode = AVAudioPlayerNode()
         obstaclePlayerNode = AVAudioPlayerNode()
-        happyPlayerNode = AVAudioPlayerNode()  // New player node
         pannerNode = AVAudioMixerNode()
         
         // Attach nodes to the audio engine
         audioEngine.attach(guidePlayerNode)
         audioEngine.attach(obstaclePlayerNode)
-        audioEngine.attach(happyPlayerNode)  // Attach new player
         audioEngine.attach(pannerNode)
         
-        // Connect nodes
+        // Connect guidePlayerNode -> pannerNode
         audioEngine.connect(guidePlayerNode, to: pannerNode, format: nil)
+        // Connect pannerNode -> main mixer
         audioEngine.connect(pannerNode, to: audioEngine.mainMixerNode, format: nil)
+        // Connect obstaclePlayerNode directly to main mixer
         audioEngine.connect(obstaclePlayerNode, to: audioEngine.mainMixerNode, format: nil)
-        audioEngine.connect(happyPlayerNode, to: audioEngine.mainMixerNode, format: nil)  // Connect new player
         
+        // Debug: Confirm connections
         print("AudioEngine connections established")
         
         // Load audio files
         guard let guideURL = Bundle.main.url(forResource: "continuousSound", withExtension: "wav"),
-              let obstacleURL = Bundle.main.url(forResource: "static", withExtension: "wav"),
-              let happyURL = Bundle.main.url(forResource: "happy", withExtension: "wav") else {
-            print("Error: Unable to find sound files")
+              let obstacleURL = Bundle.main.url(forResource: "static", withExtension: "wav") else {
+            print("Error: Unable to find sound files 'continuousSound.wav' and 'static.wav'")
             return
         }
         
         do {
+            // Load audio files
+            let guideAudioFileTemp = try AVAudioFile(forReading: guideURL)
+            let obstacleAudioFileTemp = try AVAudioFile(forReading: obstacleURL)
+            print("Audio files loaded successfully")
+            
             // Get main mixer format for buffer conversion
             let mainMixerFormat = audioEngine.mainMixerNode.outputFormat(forBus: 0)
             print("Main mixer format: \(mainMixerFormat.channelCount) channels, \(mainMixerFormat.sampleRate) Hz")
             
-            // Load and convert guide audio buffer
-            let guideAudioFile = try AVAudioFile(forReading: guideURL)
-            self.guideBuffer = try loadPCMBuffer(from: guideAudioFile, to: mainMixerFormat)
+            // Convert guide audio buffer to match main mixer format
+            let guideBufferTemp = try loadPCMBuffer(from: guideAudioFileTemp, to: mainMixerFormat)
+            self.guideBuffer = guideBufferTemp
             print("Guide audio buffer converted to main mixer format")
             
-            // Load and convert obstacle audio buffer
-            let obstacleAudioFile = try AVAudioFile(forReading: obstacleURL)
-            self.obstacleBuffer = try loadPCMBuffer(from: obstacleAudioFile, to: mainMixerFormat)
+            // Convert obstacle audio buffer to match main mixer format
+            let obstacleBufferTemp = try loadPCMBuffer(from: obstacleAudioFileTemp, to: mainMixerFormat)
+            self.obstacleBuffer = obstacleBufferTemp
             print("Obstacle audio buffer converted to main mixer format")
             
-            // Load and convert happy audio buffer
-            let happyAudioFile = try AVAudioFile(forReading: happyURL)
-            self.happyBuffer = try loadPCMBuffer(from: happyAudioFile, to: mainMixerFormat)
-            print("Happy audio buffer converted to main mixer format")
-            
+        } catch {
+            print("Error loading audio files or creating buffers: \(error.localizedDescription)")
+            return
+        }
+        
+        do {
             // Configure audio session
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(.playback, mode: .default, options: [])
             try audioSession.setActive(true)
             print("Audio session set up successfully")
-            
+        } catch {
+            print("Error setting up audio session: \(error.localizedDescription)")
+            return
+        }
+        
+        do {
             // Start the audio engine
             try audioEngine.start()
             print("Audio engine started successfully")
         } catch {
-            print("Error setting up audio: \(error.localizedDescription)")
+            print("Error starting audio engine: \(error.localizedDescription)")
         }
     }
     
@@ -271,61 +281,38 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
     
     // MARK: - Audio Position Updates
     func updateGuideAudioPosition(targetPosition: simd_float3, listenerPosition: simd_float3, listenerForward: simd_float3) {
-            let relativePosition = targetPosition - listenerPosition
-            let distance = simd_length(relativePosition)
-            
-            if distance <= 0.5 {
-                stopGuideAudio()
-                playHappyAudio()
-            } else {
-                stopHappyAudio()
-                
-                // Existing guide audio positioning logic
-                let forward = simd_normalize(simd_make_float3(listenerForward.x, 0, listenerForward.z))
-                let right = simd_cross(forward, SIMD3<Float>(0, 1, 0))
-                let relativeDirection = simd_normalize(simd_make_float3(relativePosition.x, 0, relativePosition.z))
-                
-                let dotProduct = simd_dot(forward, relativeDirection)
-                let angle = acos(dotProduct)
-                
-                let rightDotProduct = simd_dot(right, relativeDirection)
-                let sign = rightDotProduct >= 0 ? 1.0 : -1.0
-                
-                let pan = Float(sign) * sin(angle)
-                
-                let baseVolume: Float
-                if distance <= 0.5 {
-                    baseVolume = 1.0
-                } else if distance >= 6.0 {
-                    baseVolume = 0.1
-                } else {
-                    baseVolume = 1.0 - ((distance - 0.5) / 5.5) * 0.9
-                }
-                
-                let angleAttenuation = cos(angle / 2)
-                let volume = baseVolume * max(0.1, angleAttenuation)
-                
-                guidePlayerNode.volume = volume
-                pannerNode.pan = pan
-                
-                startGuideAudio()
-            }
+        let relativePosition = targetPosition - listenerPosition
+        let distance = simd_length(relativePosition)
+        
+        let forward = simd_normalize(simd_make_float3(listenerForward.x, 0, listenerForward.z))
+        let right = simd_cross(forward, SIMD3<Float>(0, 1, 0))
+        let relativeDirection = simd_normalize(simd_make_float3(relativePosition.x, 0, relativePosition.z))
+        
+        let dotProduct = simd_dot(forward, relativeDirection)
+        let angle = acos(dotProduct)
+        
+        let rightDotProduct = simd_dot(right, relativeDirection)
+        let sign = rightDotProduct >= 0 ? 1.0 : -1.0
+        
+        let pan = Float(sign) * sin(angle)
+        
+        let baseVolume: Float
+        if distance <= 0.5 {
+            baseVolume = 1.0
+        } else if distance >= 6.0 {
+            baseVolume = 0.1
+        } else {
+            baseVolume = 1.0 - ((distance - 0.5) / 5.5) * 0.9
         }
-    
-    func playHappyAudio() {
-            guard let happyBuffer = happyBuffer else {
-                print("Error: Happy buffer not loaded")
-                return
-            }
-            
-            happyPlayerNode.stop()
-            happyPlayerNode.scheduleBuffer(happyBuffer, at: nil, options: .loops, completionHandler: nil)
-            happyPlayerNode.play()
-        }
-
-        func stopHappyAudio() {
-            happyPlayerNode.stop()
-        }
+        
+        let angleAttenuation = cos(angle / 2)
+        let volume = baseVolume * max(0.1, angleAttenuation)
+        
+        guidePlayerNode.volume = volume
+        pannerNode.pan = pan
+        
+        print("Guide Audio - Angle: \(angle), Pan: \(pan), Volume: \(volume)")
+    }
     
     func updateObstacleAudio(distance: Float, direction: SIMD3<Float>) {
         if distance < safeZoneDistance {
@@ -359,55 +346,55 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
     }
     
     func stopSession() {
-        arView.session.pause()
-        stopGuideAudio()
-        stopObstacleAudio()
-        obstacleDetectionTimer?.invalidate()
-        obstacleDetectionTimer = nil
-        print("AR session stopped")
-    }
+            arView.session.pause()
+            stopGuideAudio()
+            stopObstacleAudio()
+            obstacleDetectionTimer?.invalidate()
+            obstacleDetectionTimer = nil
+            print("AR session stopped")
+        }
     
     func startObstacleDetection() {
-        obstacleDetectionTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.detectObstacles()
+            obstacleDetectionTimer?.invalidate() // Invalidate any existing timer
+            obstacleDetectionTimer = Timer.scheduledTimer(withTimeInterval: obstacleDetectionInterval, repeats: true) { [weak self] _ in
+                self?.detectObstacles()
+            }
+            print("Obstacle detection started with interval: \(obstacleDetectionInterval) seconds")
         }
-        print("Obstacle detection started")
-    }
     
     // MARK: - Obstacle Detection
     func detectObstacles() {
-        guard let frame = arView.session.currentFrame else { return }
-        
-        let cameraTransform = frame.camera.transform
-        let cameraPosition = simd_make_float3(cameraTransform.columns.3)
-        let cameraForward = simd_make_float3(cameraTransform.columns.2)
-        
-        var closestDistance: Float = Float.greatestFiniteMagnitude
-        var closestDirection: SIMD3<Float> = SIMD3<Float>(0, 0, -1)
-        
-        for direction in directions {
-            // Convert direction to world space
-            let worldDirection4 = cameraTransform * SIMD4<Float>(direction.x, direction.y, direction.z, 0)
-            let worldDirection = simd_normalize(simd_make_float3(worldDirection4.x, worldDirection4.y, worldDirection4.z))
+            guard let frame = arView.session.currentFrame else { return }
             
-            // Perform raycast
-            let query = ARRaycastQuery(origin: cameraPosition, direction: worldDirection, allowing: .estimatedPlane, alignment: .any)
-            let results = arView.session.raycast(query)
-            if let result = results.first {
-                let distance = simd_distance(cameraPosition, simd_make_float3(result.worldTransform.columns.3))
-                if distance < closestDistance {
-                    closestDistance = distance
-                    closestDirection = worldDirection
+            let cameraTransform = frame.camera.transform
+            let cameraPosition = simd_make_float3(cameraTransform.columns.3)
+            
+            var closestDistance: Float = Float.greatestFiniteMagnitude
+            var closestDirection: SIMD3<Float> = SIMD3<Float>(0, 0, -1)
+            
+            for direction in directions {
+                // Convert direction to world space
+                let worldDirection4 = cameraTransform * SIMD4<Float>(direction.x, direction.y, direction.z, 0)
+                let worldDirection = simd_normalize(simd_make_float3(worldDirection4.x, worldDirection4.y, worldDirection4.z))
+                
+                // Perform raycast
+                let query = ARRaycastQuery(origin: cameraPosition, direction: worldDirection, allowing: .estimatedPlane, alignment: .any)
+                let results = arView.session.raycast(query)
+                if let result = results.first {
+                    let distance = simd_distance(cameraPosition, simd_make_float3(result.worldTransform.columns.3))
+                    if distance < closestDistance {
+                        closestDistance = distance
+                        closestDirection = worldDirection
+                    }
                 }
             }
+            
+            if closestDistance < safeZoneDistance {
+                updateObstacleAudio(distance: closestDistance, direction: closestDirection)
+            } else {
+                updateObstacleAudio(distance: Float.greatestFiniteMagnitude, direction: SIMD3<Float>(0, 0, -1))
+            }
         }
-        
-        if closestDistance < safeZoneDistance {
-            updateObstacleAudio(distance: closestDistance, direction: closestDirection)
-        } else {
-            updateObstacleAudio(distance: Float.greatestFiniteMagnitude, direction: SIMD3<Float>(0, 0, -1))
-        }
-    }
     
     // MARK: - ARSCNViewDelegate Methods
     func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
@@ -532,8 +519,7 @@ class ARCombinedModel: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionD
         }
         
         stopGuideAudio()
-                stopObstacleAudio()
-                stopHappyAudio()
+        stopObstacleAudio()
         startSession()
         print("Session reset")
     }
